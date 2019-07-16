@@ -14,6 +14,7 @@ import (
 	"errors"
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
+	"golang.org/x/sync/errgroup"
 )
 
 // CommonResponse returns the headers common to all blob REST API responses.
@@ -100,7 +101,7 @@ func UploadBufferToBlockBlob(ctx context.Context, b []byte,
 		transferSize:  bufferSize,
 		chunkSize:     o.BlockSize,
 		parallelism:   o.Parallelism,
-		operation: func(offset int64, count int64) error {
+		operation: func(ctx context.Context, offset int64, count int64) error {
 			// This function is called once per block.
 			// It is passed this block's offset within the buffer and its count of bytes
 			// Prepare to read the proper block/section of the buffer
@@ -203,7 +204,7 @@ func downloadBlobToBuffer(ctx context.Context, blobURL BlobURL, offset int64, co
 		transferSize:  count,
 		chunkSize:     o.BlockSize,
 		parallelism:   o.Parallelism,
-		operation: func(chunkStart int64, count int64) error {
+		operation: func(ctx context.Context, chunkStart int64, count int64) error {
 			dr, err := blobURL.Download(ctx, chunkStart+offset, count, o.AccessConditions, false)
 			if err != nil {
 				return err
@@ -290,7 +291,7 @@ type batchTransferOptions struct {
 	transferSize  int64
 	chunkSize     int64
 	parallelism   uint16
-	operation     func(offset int64, chunkSize int64) error
+	operation     func(ctx context.Context, offset int64, chunkSize int64) error
 	operationName string
 }
 
@@ -299,27 +300,26 @@ func doBatchTransfer(ctx context.Context, o batchTransferOptions) error {
 	// Prepare and do parallel operations.
 	numChunks := uint16(((o.transferSize - 1) / o.chunkSize) + 1)
 	operationChannel := make(chan func() error, o.parallelism) // Create the channel that release 'parallelism' goroutines concurrently
-	operationResponseChannel := make(chan error, numChunks)    // Holds each response
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	group, gCtx := errgroup.WithContext(ctx)
 
 	// Create the goroutines that process each operation (in parallel).
 	if o.parallelism == 0 {
 		o.parallelism = 5 // default parallelism
 	}
 	for g := uint16(0); g < o.parallelism; g++ {
-		//grIndex := g
-		go func() {
+		group.Go(func() error {
 			for f := range operationChannel {
-				//fmt.Printf("[%s] gr-%d start action\n", o.operationName, grIndex)
 				err := f()
-				operationResponseChannel <- err
-				//fmt.Printf("[%s] gr-%d end action\n", o.operationName, grIndex)
+				if err != nil {
+					return err
+				}
 			}
-		}()
+			return nil
+		})
 	}
 
 	// Add each chunk's operation to the channel.
+CHUNK_LOOP:
 	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
 		curChunkSize := o.chunkSize
 
@@ -328,21 +328,19 @@ func doBatchTransfer(ctx context.Context, o batchTransferOptions) error {
 		}
 		offset := int64(chunkNum) * o.chunkSize
 
-		operationChannel <- func() error {
-			return o.operation(offset, curChunkSize)
+		op := func() error {
+			return o.operation(gCtx, offset, curChunkSize)
+		}
+		select {
+		case <-gCtx.Done():
+			break CHUNK_LOOP
+		case operationChannel <- op:
+			continue
 		}
 	}
 	close(operationChannel)
 
-	// Wait for the operations to complete.
-	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
-		responseError := <-operationResponseChannel
-		if responseError != nil {
-			cancel()             // As soon as any operation fails, cancel all remaining operation calls
-			return responseError // No need to process anymore responses
-		}
-	}
-	return nil
+	return group.Wait()
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
